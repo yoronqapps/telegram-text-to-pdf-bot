@@ -2,6 +2,7 @@ import os
 import io
 import re
 import html
+import asyncio
 import logging
 import urllib.request
 from datetime import datetime, timezone
@@ -749,19 +750,67 @@ async def _send_pdf(update: Update, pdf_bytes: bytes) -> None:
     )
 
 
+# Telegram's Bot API hard-caps a single text message at 4096 characters.
+# Clients (and the API itself) silently split anything longer into several
+# back-to-back messages with no separator added, so we have to reassemble
+# them ourselves before generating a PDF — otherwise one long paste turns
+# into two or three separate PDFs.
+TELEGRAM_TEXT_LIMIT = 4096
+_SPLIT_FLUSH_DELAY  = 1.5   # seconds to wait for a possible continuation chunk
+
+# chat_id -> {"chunks": [...], "task": asyncio.Task | None}
+_pending_text: dict[int, dict] = {}
+
+
+async def _flush_pending_text(chat_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state = _pending_text.pop(chat_id, None)
+    if not state or not state["chunks"]:
+        return
+    full_text = "".join(state["chunks"])
+    try:
+        pdf_bytes = make_pdf(full_text, _get_theme(context), _get_font(context))
+    except Exception as e:
+        logging.error(f"PDF generation failed: {e}", exc_info=True)
+        await update.message.reply_text("Sorry, could not generate PDF. Try again.")
+        return
+    await _send_pdf(update, pdf_bytes)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         raw = update.message.text
         if not raw or not raw.strip():
             await update.message.reply_text("Please send a text message.")
             return
-        try:
-            pdf_bytes = make_pdf(raw, _get_theme(context), _get_font(context))
-        except Exception as e:
-            logging.error(f"PDF generation failed: {e}", exc_info=True)
-            await update.message.reply_text("Sorry, could not generate PDF. Try again.")
-            return
-        await _send_pdf(update, pdf_bytes)
+
+        chat_id = update.effective_chat.id
+        state = _pending_text.setdefault(chat_id, {"chunks": [], "task": None})
+
+        # A fresh chunk arrived — any previous safety-net timer is now stale.
+        if state["task"] is not None:
+            state["task"].cancel()
+            state["task"] = None
+
+        state["chunks"].append(raw)
+
+        if len(raw) >= TELEGRAM_TEXT_LIMIT:
+            # This chunk hit the hard cap, so Telegram almost certainly had
+            # to cut it off mid-text. Hold briefly for the rest instead of
+            # generating a PDF from a truncated fragment.
+            async def _delayed_flush():
+                try:
+                    await asyncio.sleep(_SPLIT_FLUSH_DELAY)
+                    await _flush_pending_text(chat_id, update, context)
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logging.error(f"delayed flush failed: {e}", exc_info=True)
+
+            state["task"] = asyncio.create_task(_delayed_flush())
+        else:
+            # Under the limit: either a normal complete message, or the
+            # tail end of a split one — either way we're done, flush now.
+            await _flush_pending_text(chat_id, update, context)
     except Exception as e:
         logging.error(f"handle_text error: {e}", exc_info=True)
         try:
