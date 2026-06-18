@@ -154,10 +154,6 @@ _SCRIPT_FONTS: dict[str, list[str]] = {
 
 def _pick_font(script: str, latin_font: str) -> str:
     """Return the best available registered font for the given script."""
-    # NOTE: previously this fell through to DejaVuSans even for "latin" text
-    # whenever DejaVuSans was registered, which silently ignored the user's
-    # /font choice (Helvetica/Times/Courier) for almost all English text.
-    # Latin script should always respect the explicit choice.
     if script == "latin":
         return latin_font
     for candidate in _SCRIPT_FONTS.get(script, []):
@@ -176,6 +172,42 @@ def _prepare_line(line: str, script: str) -> str:
     return line
 
 
+# ── Emoji handling ─────────────────────────────────────────────────────────
+# ReportLab's built-in fonts (and the plain TTF faces we register) have no
+# color/SVG emoji glyphs, so any emoji Claude writes (✅ ❌ 🚀 etc.) renders
+# as a solid missing-glyph box. Rather than try to embed a color emoji font
+# (pdfgen can't draw those layers at all), we swap the common ones Claude
+# actually uses for plain-text/ASCII equivalents that always render cleanly,
+# and drop any other emoji so nothing shows up as a black box.
+_EMOJI_REPLACEMENTS = {
+    "✅": "[x]", "☑": "[x]", "✔": "[x]",
+    "❌": "[ ]", "✖": "[ ]", "✗": "[ ]",
+    "⚠": "[!]", "⚠️": "[!]",
+    "➡": "->", "→": "->", "⬅": "<-", "←": "<-",
+    "•": "-",
+    "🔴": "(red)", "🟢": "(green)", "🟡": "(yellow)",
+    "⭐": "*", "★": "*",
+}
+
+# Broad ranges covering misc symbols, dingbats, emoticons, transport,
+# supplemental symbols, and flags — i.e. anything that's emoji-shaped and
+# not in a normal text font.
+_EMOJI_RANGE_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U0000FE0F"             # variation selector (emoji presentation)
+    "]+"
+)
+
+
+def _strip_emoji(text: str) -> str:
+    for emoji, replacement in _EMOJI_REPLACEMENTS.items():
+        text = text.replace(emoji, replacement)
+    return _EMOJI_RANGE_RE.sub("", text)
+
+
 # ── Design constants ──────────────────────────────────────────────────────────
 PAGE_W, PAGE_H = A4
 MG = 2.5 * cm
@@ -188,6 +220,8 @@ C_QUOTE     = HexColor("#52525B")
 C_CODE_BG   = HexColor("#F4F4F5")
 C_CODE_BOX  = HexColor("#E4E4E7")
 C_LINK      = HexColor("#2563EB")
+C_TABLE_HDR_BG = HexColor("#F4F4F5")
+C_TABLE_GRID   = HexColor("#E4E4E7")
 
 THEMES = {
     "navy":    (HexColor("#DBEAFE"), "🌊 Ocean Navy"),
@@ -282,9 +316,7 @@ def _inline_to_xml(text: str) -> str:
     """Convert one line/paragraph of markdown inline syntax into ReportLab's
     mini-XML markup, escaping everything else so it's always safe to feed
     straight into a Paragraph()."""
-    # Stash code spans and links first so markup inside them (e.g. an
-    # underscore in a URL, or asterisks in a code sample) is never touched
-    # by the bold/italic/strike passes below.
+    text = _strip_emoji(text)
     stash = []
 
     def _stash(value: str) -> str:
@@ -303,31 +335,53 @@ def _inline_to_xml(text: str) -> str:
     text = _CODE_SPAN_RE.sub(_code_sub, text)
     text = _LINK_RE.sub(_link_sub, text)
 
-    # Escape what's left, then layer on bold/italic/strikethrough tags.
     text = html.escape(text)
     text = _BOLD_RE.sub(lambda m: f"<b>{m.group(1) or m.group(2)}</b>", text)
     text = _ITALIC_RE.sub(lambda m: f"<i>{m.group(1) or m.group(2)}</i>", text)
     text = _STRIKE_RE.sub(lambda m: f"<strike>{m.group(1)}</strike>", text)
 
-    # Restore stashed code/link fragments.
     for i, value in enumerate(stash):
         text = text.replace(f"\x00{i}\x00", value)
     return text
 
 
-# ── Markdown block parsing (headings / lists / quotes / code fences / hr) ────
+# ── Markdown block parsing (headings / lists / quotes / code fences / hr / tables) ────
 _HEADER_RE = re.compile(r'^(#{1,6})\s+(.*)$')
-_UL_RE     = re.compile(r'^\s*[-*+]\s+(.*)$')
-_OL_RE     = re.compile(r'^\s*\d+[.)]\s+(.*)$')
+_UL_RE     = re.compile(r'^(\s*)[-*+]\s+(.*)$')
+_OL_RE     = re.compile(r'^(\s*)(\d+)[.)]\s+(.*)$')
 _HR_RE     = re.compile(r'^\s*([-*_])\1{2,}\s*$')
 _QUOTE_RE  = re.compile(r'^\s*>\s?(.*)$')
 _FENCE_RE  = re.compile(r'^\s*```')
+_TABLE_ROW_RE = re.compile(r'^\s*\|(.+)\|\s*$')
+_TABLE_SEP_RE = re.compile(r'^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$')
 
 
-def _parse_markdown_blocks(text: str) -> list[tuple[str, str]]:
+def _indent_level(spaces: str) -> int:
+    """Convert leading whitespace into a nesting depth (0, 1, 2, ...).
+    Markdown nesting is conventionally 2 or 4 spaces per level; we use 2
+    as the unit so both common conventions land on sane depths."""
+    n = len(spaces.replace("\t", "  "))
+    return min(n // 2, 4)  # cap depth so deeply-indented text doesn't run off the page
+
+
+def _split_table_row(row: str) -> list[str]:
+    """Split a markdown table row on unescaped pipes."""
+    row = row.strip()
+    if row.startswith("|"):
+        row = row[1:]
+    if row.endswith("|"):
+        row = row[:-1]
+    # split on | not preceded by backslash
+    cells = re.split(r'(?<!\\)\|', row)
+    return [c.strip().replace("\\|", "|") for c in cells]
+
+
+def _parse_markdown_blocks(text: str) -> list[tuple[str, object]]:
     """Split raw text into (block_type, content) pairs. block_type is one of:
-    'p', 'h1'..'h6', 'ul', 'ol', 'quote', 'code', 'hr'."""
-    blocks: list[tuple[str, str]] = []
+    'p', 'h1'..'h6', 'ul', 'ol', 'quote', 'code', 'hr', 'table'.
+    For 'ul'/'ol', content is (indent_level, text). For 'table', content is
+    a list of rows, each a list of cell strings (first row = header)."""
+    blocks: list[tuple[str, object]] = []
     lines = text.split("\n")
     buf: list[str] = []
     i = 0
@@ -349,6 +403,18 @@ def _parse_markdown_blocks(text: str) -> list[tuple[str, str]]:
                 i += 1
             i += 1  # skip closing fence (if present)
             blocks.append(("code", "\n".join(code_lines)))
+            continue
+
+        # Table: a row line followed by a separator line (---|---|---)
+        if _TABLE_ROW_RE.match(line) and i + 1 < len(lines) and _TABLE_SEP_RE.match(lines[i + 1]):
+            _flush_paragraph()
+            header = _split_table_row(line)
+            i += 2  # skip header + separator
+            rows = [header]
+            while i < len(lines) and _TABLE_ROW_RE.match(lines[i]):
+                rows.append(_split_table_row(lines[i]))
+                i += 1
+            blocks.append(("table", rows))
             continue
 
         if not line.strip():
@@ -383,14 +449,16 @@ def _parse_markdown_blocks(text: str) -> list[tuple[str, str]]:
         m = _UL_RE.match(line)
         if m:
             _flush_paragraph()
-            blocks.append(("ul", m.group(1)))
+            indent, content = m.group(1), m.group(2)
+            blocks.append(("ul", (_indent_level(indent), content)))
             i += 1
             continue
 
         m = _OL_RE.match(line)
         if m:
             _flush_paragraph()
-            blocks.append(("ol", m.group(1)))
+            indent, num, content = m.group(1), m.group(2), m.group(3)
+            blocks.append(("ol", (_indent_level(indent), content, int(num))))
             i += 1
             continue
 
@@ -463,13 +531,69 @@ def _code_block_flowable(code_text: str) -> Table:
     return tbl
 
 
-def _build_list(items_xml: list[str], font_name: str, ordered: bool) -> ListFlowable:
-    style = ParagraphStyle("li", fontName=font_name, fontSize=12, leading=17, spaceAfter=3)
-    items = [ListItem(Paragraph(t, style), leftIndent=4) for t in items_xml]
+def _table_flowable(rows: list[list[str]], font_name: str, accent_color) -> Table:
+    """Render a markdown table as a styled ReportLab Table. First row = header."""
+    n_cols = max(len(r) for r in rows)
+    # pad short rows
+    norm_rows = [r + [""] * (n_cols - len(r)) for r in rows]
+
+    cell_style = ParagraphStyle("cell", fontName=font_name, fontSize=10, leading=14, textColor=C_BODY)
+    hdr_style = ParagraphStyle("cellhdr", fontName=font_name, fontSize=10, leading=14,
+                               textColor=C_BODY, fontWeight="bold")
+
+    data = []
+    for r_idx, row in enumerate(norm_rows):
+        style = hdr_style if r_idx == 0 else cell_style
+        cells = []
+        for cell_text in row:
+            xml = _inline_to_xml(cell_text)
+            if r_idx == 0:
+                xml = f"<b>{xml}</b>"
+            cells.append(Paragraph(xml, style))
+        data.append(cells)
+
+    avail_width = PAGE_W - 2 * MG
+    col_width = avail_width / n_cols
+    tbl = Table(data, colWidths=[col_width] * n_cols, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), C_TABLE_HDR_BG),
+        ("GRID", (0, 0), (-1, -1), 0.5, C_TABLE_GRID),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    return tbl
+
+
+def _build_list(items: list[tuple[int, str, int | None]], font_name: str, ordered: bool) -> ListFlowable:
+    """items: list of (indent_level, xml_text, number_or_None).
+    Builds a single flat ListFlowable but offsets each item's leftIndent by
+    its nesting depth, so sub-items visually nest without needing a fully
+    recursive flowable tree (which Platypus makes painful for mixed depths)."""
+    style_cache: dict[int, ParagraphStyle] = {}
+
+    def _style_for(depth: int) -> ParagraphStyle:
+        if depth not in style_cache:
+            style_cache[depth] = ParagraphStyle(
+                f"li{depth}", fontName=font_name, fontSize=12 - min(depth, 2),
+                leading=17 - min(depth, 2), spaceAfter=3,
+            )
+        return style_cache[depth]
+
+    list_items = []
+    for depth, xml_text, _num in items:
+        style = _style_for(depth)
+        list_items.append(ListItem(
+            Paragraph(xml_text, style),
+            leftIndent=4 + depth * 16,
+        ))
+
     return ListFlowable(
-        items,
+        list_items,
         bulletType="1" if ordered else "bullet",
-        start=1 if ordered else None,
+        start=items[0][2] if (ordered and items and items[0][2]) else (1 if ordered else None),
         leftIndent=20,
         bulletFontName="Helvetica",
         bulletFontSize=11,
@@ -481,29 +605,36 @@ def _build_list(items_xml: list[str], font_name: str, ordered: bool) -> ListFlow
 
 def _markdown_to_story(text: str, latin_font: str, accent_color) -> list:
     """Render markdown (the same kind Claude outputs: headings, **bold**,
-    *italic*, `code`, fenced code blocks, lists, quotes, links, hr) into a
-    Platypus story, auto-selecting Unicode fonts per block as before."""
+    *italic*, `code`, fenced code blocks, lists (incl. nested), quotes,
+    links, hr, tables) into a Platypus story, auto-selecting Unicode fonts
+    per block."""
     blocks = _parse_markdown_blocks(text)
     story: list = []
-    pending_items: list[str] = []
+    pending_items: list[tuple[int, str, int | None]] = []
     pending_ordered: bool | None = None
 
     def _flush_list():
         nonlocal pending_items, pending_ordered
         if pending_items:
-            script = _detect_script(" ".join(pending_items))
-            font_name = _pick_font(script, latin_font)
-            story.append(_build_list(pending_items, font_name, bool(pending_ordered)))
+            story.append(_build_list(pending_items, latin_font, bool(pending_ordered)))
         pending_items = []
         pending_ordered = None
 
     for btype, content in blocks:
         if btype in ("ul", "ol"):
             ordered = (btype == "ol")
+            if btype == "ul":
+                depth, raw_text = content
+                num = None
+            else:
+                depth, raw_text, num = content
             if pending_items and pending_ordered != ordered:
                 _flush_list()
             pending_ordered = ordered
-            pending_items.append(_inline_to_xml(content))
+            script = _detect_script(raw_text)
+            font_name = _pick_font(script, latin_font)
+            xml = _inline_to_xml(raw_text)
+            pending_items.append((depth, xml, num))
             continue
 
         _flush_list()
@@ -517,6 +648,12 @@ def _markdown_to_story(text: str, latin_font: str, accent_color) -> list:
             story.append(Spacer(1, 2))
             story.append(_code_block_flowable(content))
             story.append(Spacer(1, 8))
+            continue
+
+        if btype == "table":
+            story.append(Spacer(1, 4))
+            story.append(_table_flowable(content, latin_font, accent_color))
+            story.append(Spacer(1, 10))
             continue
 
         if btype == "quote":
@@ -556,7 +693,7 @@ def _text_to_story(text: str, latin_font: str) -> list:
         script = _detect_script(line)
         font_name = _pick_font(script, latin_font)
         display = _prepare_line(line, script)
-        safe = html.escape(display)
+        safe = html.escape(_strip_emoji(display))
         story.append(Paragraph(safe, _make_para_style(font_name, script)))
     return story
 
@@ -673,8 +810,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Markdown formatting kept in the PDF:*\n"
         "`# Headings`, `**bold**`, `*italic*`, `~~strike~~`,\n"
         "`` `inline code` ``, fenced \\`\\`\\` code blocks \\`\\`\\`,\n"
-        "`- bullet` / `1. numbered` lists, `> quotes`,\n"
-        "`[links](url)` and `---` dividers\n\n"
+        "`- bullet` / `1. numbered` lists (nested too),\n"
+        "`> quotes`, `[links](url)`, `---` dividers,\n"
+        "and `| markdown | tables |`\n\n"
         "*Languages supported:*\n"
         "Amharic 🇪🇹, Arabic 🇸🇦, Hindi 🇮🇳, Thai 🇹🇭,\n"
         "Latin/Greek/Cyrillic and more\n\n"
