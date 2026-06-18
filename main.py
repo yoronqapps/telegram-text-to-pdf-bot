@@ -26,14 +26,19 @@ from reportlab.pdfbase.ttfonts import TTFont
 logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# ── Flask keep-alive ──────────────────────────────────────────────────────────
+# ── Port / domain detection ───────────────────────────────────────────────────
+PORT           = int(os.environ.get("PORT", 6000))
+RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")   # set by Railway automatically
+
+# ── Flask keep-alive (used only when NOT on Railway / no webhook) ─────────────
 app_web = Flask('')
 
 @app_web.route('/')
 def home():
     return "alive"
 
-Thread(target=lambda: app_web.run(host='0.0.0.0', port=6000), daemon=True).start()
+if not RAILWAY_DOMAIN:
+    Thread(target=lambda: app_web.run(host='0.0.0.0', port=PORT), daemon=True).start()
 
 # ── Arabic reshaper (optional; graceful fallback if not installed) ─────────────
 try:
@@ -479,15 +484,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-# ── Conflict error handler — waits for old connection to expire ───────────────
+# ── General error handler ─────────────────────────────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    import asyncio
-    from telegram.error import Conflict
-    if isinstance(context.error, Conflict):
-        logging.warning("Conflict: another instance still connected. Waiting 30 s…")
-        await asyncio.sleep(30)
-    else:
-        logging.error(f"Unhandled error: {context.error}", exc_info=context.error)
+    logging.error(f"Unhandled error: {context.error}", exc_info=context.error)
 
 
 # ── Wire up & run ─────────────────────────────────────────────────────────────
@@ -502,4 +501,18 @@ app.add_handler(MessageHandler(filters.PHOTO,                         handle_pho
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,       handle_text))
 app.add_error_handler(error_handler)
 print("Bot running...")
-app.run_polling(drop_pending_updates=True)
+
+if RAILWAY_DOMAIN:
+    # Production (Railway): webhook mode — Telegram pushes updates, no polling conflicts
+    logging.info(f"Webhook mode → https://{RAILWAY_DOMAIN}/{BOT_TOKEN}")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_TOKEN,
+        webhook_url=f"https://{RAILWAY_DOMAIN}/{BOT_TOKEN}",
+        drop_pending_updates=True,
+    )
+else:
+    # Local / Replit: polling mode
+    logging.info("Polling mode (local)")
+    app.run_polling(drop_pending_updates=True)
