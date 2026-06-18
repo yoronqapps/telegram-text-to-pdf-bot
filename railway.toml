@@ -1,7 +1,7 @@
 [build]
 builder = "nixpacks"
-buildCommand = "pip install -r bot/requirements.txt"
+buildCommand = "pip install -r requirements.txt"
 
 [deploy]
-startCommand = "cd bot && python main.py"
+startCommand = "python main.py"
 restartPolicyType = "always"
