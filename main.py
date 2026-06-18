@@ -751,12 +751,12 @@ async def _send_pdf(update: Update, pdf_bytes: bytes) -> None:
 
 
 # Telegram's Bot API hard-caps a single text message at 4096 characters.
-# Clients (and the API itself) silently split anything longer into several
-# back-to-back messages with no separator added, so we have to reassemble
-# them ourselves before generating a PDF — otherwise one long paste turns
-# into two or three separate PDFs.
-TELEGRAM_TEXT_LIMIT = 4096
-_SPLIT_FLUSH_DELAY  = 1.5   # seconds to wait for a possible continuation chunk
+# When a client has to split a longer paste, it tries to cut at a nearby
+# line break rather than exactly at the limit — so chunk length alone isn't
+# a reliable signal for "more is coming." Instead, every incoming text
+# message restarts a short timer; only once the timer elapses with nothing
+# new for that chat do we merge whatever arrived and generate one PDF.
+BATCH_DELAY = 1.5   # seconds to wait for a possible continuation chunk
 
 # chat_id -> {"chunks": [...], "task": asyncio.Task | None}
 _pending_text: dict[int, dict] = {}
@@ -786,31 +786,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         state = _pending_text.setdefault(chat_id, {"chunks": [], "task": None})
 
-        # A fresh chunk arrived — any previous safety-net timer is now stale.
+        # A fresh chunk arrived — any previous timer is stale, cancel it.
         if state["task"] is not None:
             state["task"].cancel()
             state["task"] = None
 
         state["chunks"].append(raw)
 
-        if len(raw) >= TELEGRAM_TEXT_LIMIT:
-            # This chunk hit the hard cap, so Telegram almost certainly had
-            # to cut it off mid-text. Hold briefly for the rest instead of
-            # generating a PDF from a truncated fragment.
-            async def _delayed_flush():
-                try:
-                    await asyncio.sleep(_SPLIT_FLUSH_DELAY)
-                    await _flush_pending_text(chat_id, update, context)
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logging.error(f"delayed flush failed: {e}", exc_info=True)
+        # Quick "I'm on it" indicator since the actual PDF now arrives after
+        # a short delay rather than instantly.
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action="upload_document")
+        except Exception:
+            pass
 
-            state["task"] = asyncio.create_task(_delayed_flush())
-        else:
-            # Under the limit: either a normal complete message, or the
-            # tail end of a split one — either way we're done, flush now.
-            await _flush_pending_text(chat_id, update, context)
+        async def _delayed_flush():
+            try:
+                await asyncio.sleep(BATCH_DELAY)
+                await _flush_pending_text(chat_id, update, context)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logging.error(f"delayed flush failed: {e}", exc_info=True)
+
+        state["task"] = asyncio.create_task(_delayed_flush())
     except Exception as e:
         logging.error(f"handle_text error: {e}", exc_info=True)
         try:
