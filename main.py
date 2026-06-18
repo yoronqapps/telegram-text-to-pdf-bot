@@ -479,6 +479,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+# ── Conflict error handler — waits for old connection to expire ───────────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    import asyncio
+    from telegram.error import Conflict
+    if isinstance(context.error, Conflict):
+        logging.warning("Conflict: another instance still connected. Waiting 30 s…")
+        await asyncio.sleep(30)
+    else:
+        logging.error(f"Unhandled error: {context.error}", exc_info=context.error)
+
+
 # ── Wire up & run ─────────────────────────────────────────────────────────────
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler("start", cmd_start))
@@ -489,5 +500,6 @@ app.add_handler(CallbackQueryHandler(cb_font,  pattern=r"^font:"))
 app.add_handler(CallbackQueryHandler(cb_theme, pattern=r"^theme:"))
 app.add_handler(MessageHandler(filters.PHOTO,                         handle_photo))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,       handle_text))
+app.add_error_handler(error_handler)
 print("Bot running...")
-app.run_polling()
+app.run_polling(drop_pending_updates=True)
