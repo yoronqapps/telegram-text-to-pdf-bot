@@ -1,4 +1,4 @@
-python-telegram-bot==21.6
+python-telegram-bot[webhooks]==21.6
 reportlab==4.2.2
 flask==3.0.3
 arabic-reshaper==3.0.1
