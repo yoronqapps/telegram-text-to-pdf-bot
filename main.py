@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import html
 import logging
 import urllib.request
@@ -14,7 +15,10 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes,
 )
 from reportlab.pdfgen import canvas as rl_canvas
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Image as RLImage,
+    Preformatted, Table, TableStyle, ListFlowable, ListItem, HRFlowable,
+)
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_RIGHT
@@ -37,9 +41,6 @@ app_web = Flask('')
 def home():
     return "alive"
 
-if not RAILWAY_DOMAIN:
-    Thread(target=lambda: app_web.run(host='0.0.0.0', port=PORT), daemon=True).start()
-
 # ── Arabic reshaper (optional; graceful fallback if not installed) ─────────────
 try:
     import arabic_reshaper
@@ -53,7 +54,7 @@ except ImportError:
 FONT_DIR = Path(__file__).parent / "fonts"
 FONT_DIR.mkdir(exist_ok=True)
 
-_DEJAVU = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+_DEJAVU_DIR = "/usr/share/fonts/truetype/dejavu"
 _REGISTERED: set[str] = set()   # tracks successfully registered font names
 
 def _try_register(name: str, path: str) -> bool:
@@ -67,9 +68,22 @@ def _try_register(name: str, path: str) -> bool:
         logging.warning(f"Could not register {name}: {e}")
         return False
 
-# Register DejaVu Sans immediately (system font — covers Latin/Greek/Cyrillic/Hebrew)
-if Path(_DEJAVU).exists():
-    _try_register("DejaVuSans", _DEJAVU)
+# Register DejaVu Sans + its real bold/italic faces (system font — covers
+# Latin/Greek/Cyrillic/Hebrew). Having the real faces means <b>/<i> tags in
+# markdown actually render bold/italic instead of just falling back to regular.
+_try_register("DejaVuSans", f"{_DEJAVU_DIR}/DejaVuSans.ttf")
+_try_register("DejaVuSans-Bold", f"{_DEJAVU_DIR}/DejaVuSans-Bold.ttf")
+_try_register("DejaVuSans-Oblique", f"{_DEJAVU_DIR}/DejaVuSans-Oblique.ttf")
+_try_register("DejaVuSans-BoldOblique", f"{_DEJAVU_DIR}/DejaVuSans-BoldOblique.ttf")
+
+if "DejaVuSans" in _REGISTERED:
+    pdfmetrics.registerFontFamily(
+        "DejaVuSans",
+        normal="DejaVuSans",
+        bold="DejaVuSans-Bold" if "DejaVuSans-Bold" in _REGISTERED else "DejaVuSans",
+        italic="DejaVuSans-Oblique" if "DejaVuSans-Oblique" in _REGISTERED else "DejaVuSans",
+        boldItalic="DejaVuSans-BoldOblique" if "DejaVuSans-BoldOblique" in _REGISTERED else "DejaVuSans",
+    )
 
 # Noto fonts to download for non-Latin scripts
 _NOTO_URLS: dict[str, str] = {
@@ -91,6 +105,11 @@ def _load_noto_fonts() -> None:
                 logging.warning(f"Download failed ({name}): {e}")
                 continue
         _try_register(name, str(dest))
+        # No bold/italic faces available for these — map them to themselves so
+        # that <b>/<i> tags in markdown don't crash ReportLab's Paragraph parser
+        # (it still renders regular weight, but that's better than an exception).
+        if name in _REGISTERED:
+            pdfmetrics.registerFontFamily(name, normal=name, bold=name, italic=name, boldItalic=name)
 
 # Load Noto fonts synchronously at startup so they're ready before first PDF
 _load_noto_fonts()
@@ -134,10 +153,15 @@ _SCRIPT_FONTS: dict[str, list[str]] = {
 
 def _pick_font(script: str, latin_font: str) -> str:
     """Return the best available registered font for the given script."""
+    # NOTE: previously this fell through to DejaVuSans even for "latin" text
+    # whenever DejaVuSans was registered, which silently ignored the user's
+    # /font choice (Helvetica/Times/Courier) for almost all English text.
+    # Latin script should always respect the explicit choice.
+    if script == "latin":
+        return latin_font
     for candidate in _SCRIPT_FONTS.get(script, []):
         if candidate in _REGISTERED:
             return candidate
-    # Fallback chain: user Latin font → DejaVuSans → Helvetica
     if "DejaVuSans" in _REGISTERED:
         return "DejaVuSans"
     return latin_font
@@ -159,6 +183,10 @@ C_LABEL     = HexColor("#999999")
 C_FOOTER    = HexColor("#AAAAAA")
 C_WATERMARK = HexColor("#DEDEDE")
 C_BODY      = HexColor("#1A1A1A")
+C_QUOTE     = HexColor("#52525B")
+C_CODE_BG   = HexColor("#F4F4F5")
+C_CODE_BOX  = HexColor("#E4E4E7")
+C_LINK      = HexColor("#2563EB")
 
 THEMES = {
     "navy":    (HexColor("#DBEAFE"), "🌊 Ocean Navy"),
@@ -241,6 +269,137 @@ def _canvas_factory(divider_color, timestamp):
     return _C
 
 
+# ── Markdown inline parsing (bold / italic / strike / code / links) ───────────
+_CODE_SPAN_RE = re.compile(r'`([^`]+?)`')
+_LINK_RE      = re.compile(r'\[([^\]]+)\]\(([^)\s]+)\)')
+_BOLD_RE      = re.compile(r'\*\*(.+?)\*\*|__(.+?)__')
+_ITALIC_RE    = re.compile(r'(?<!\*)\*(?!\*)([^*]+?)\*(?!\*)|(?<!_)_(?!_)([^_]+?)_(?!_)')
+_STRIKE_RE    = re.compile(r'~~(.+?)~~')
+
+
+def _inline_to_xml(text: str) -> str:
+    """Convert one line/paragraph of markdown inline syntax into ReportLab's
+    mini-XML markup, escaping everything else so it's always safe to feed
+    straight into a Paragraph()."""
+    # Stash code spans and links first so markup inside them (e.g. an
+    # underscore in a URL, or asterisks in a code sample) is never touched
+    # by the bold/italic/strike passes below.
+    stash = []
+
+    def _stash(value: str) -> str:
+        token = f"\x00{len(stash)}\x00"
+        stash.append(value)
+        return token
+
+    def _code_sub(m):
+        return _stash(f'<font face="Courier" size="10">{html.escape(m.group(1))}</font>')
+
+    def _link_sub(m):
+        label = html.escape(m.group(1))
+        url = html.escape(m.group(2), quote=True)
+        return _stash(f'<link href="{url}"><font color="#{C_LINK.hexval()[2:]}"><u>{label}</u></font></link>')
+
+    text = _CODE_SPAN_RE.sub(_code_sub, text)
+    text = _LINK_RE.sub(_link_sub, text)
+
+    # Escape what's left, then layer on bold/italic/strikethrough tags.
+    text = html.escape(text)
+    text = _BOLD_RE.sub(lambda m: f"<b>{m.group(1) or m.group(2)}</b>", text)
+    text = _ITALIC_RE.sub(lambda m: f"<i>{m.group(1) or m.group(2)}</i>", text)
+    text = _STRIKE_RE.sub(lambda m: f"<strike>{m.group(1)}</strike>", text)
+
+    # Restore stashed code/link fragments.
+    for i, value in enumerate(stash):
+        text = text.replace(f"\x00{i}\x00", value)
+    return text
+
+
+# ── Markdown block parsing (headings / lists / quotes / code fences / hr) ────
+_HEADER_RE = re.compile(r'^(#{1,6})\s+(.*)$')
+_UL_RE     = re.compile(r'^\s*[-*+]\s+(.*)$')
+_OL_RE     = re.compile(r'^\s*\d+[.)]\s+(.*)$')
+_HR_RE     = re.compile(r'^\s*([-*_])\1{2,}\s*$')
+_QUOTE_RE  = re.compile(r'^\s*>\s?(.*)$')
+_FENCE_RE  = re.compile(r'^\s*```')
+
+
+def _parse_markdown_blocks(text: str) -> list[tuple[str, str]]:
+    """Split raw text into (block_type, content) pairs. block_type is one of:
+    'p', 'h1'..'h6', 'ul', 'ol', 'quote', 'code', 'hr'."""
+    blocks: list[tuple[str, str]] = []
+    lines = text.split("\n")
+    buf: list[str] = []
+    i = 0
+
+    def _flush_paragraph():
+        if buf:
+            blocks.append(("p", " ".join(buf)))
+            buf.clear()
+
+    while i < len(lines):
+        line = lines[i]
+
+        if _FENCE_RE.match(line):
+            _flush_paragraph()
+            i += 1
+            code_lines = []
+            while i < len(lines) and not _FENCE_RE.match(lines[i]):
+                code_lines.append(lines[i])
+                i += 1
+            i += 1  # skip closing fence (if present)
+            blocks.append(("code", "\n".join(code_lines)))
+            continue
+
+        if not line.strip():
+            _flush_paragraph()
+            i += 1
+            continue
+
+        m = _HEADER_RE.match(line)
+        if m:
+            _flush_paragraph()
+            blocks.append((f"h{len(m.group(1))}", m.group(2).strip()))
+            i += 1
+            continue
+
+        if _HR_RE.match(line):
+            _flush_paragraph()
+            blocks.append(("hr", ""))
+            i += 1
+            continue
+
+        m = _QUOTE_RE.match(line)
+        if m:
+            _flush_paragraph()
+            quote_lines = [m.group(1)]
+            i += 1
+            while i < len(lines) and _QUOTE_RE.match(lines[i]):
+                quote_lines.append(_QUOTE_RE.match(lines[i]).group(1))
+                i += 1
+            blocks.append(("quote", " ".join(quote_lines)))
+            continue
+
+        m = _UL_RE.match(line)
+        if m:
+            _flush_paragraph()
+            blocks.append(("ul", m.group(1)))
+            i += 1
+            continue
+
+        m = _OL_RE.match(line)
+        if m:
+            _flush_paragraph()
+            blocks.append(("ol", m.group(1)))
+            i += 1
+            continue
+
+        buf.append(line.strip())
+        i += 1
+
+    _flush_paragraph()
+    return blocks
+
+
 # ── Story builders ─────────────────────────────────────────────────────────────
 def _make_para_style(font_name: str, script: str) -> ParagraphStyle:
     return ParagraphStyle(
@@ -249,22 +408,154 @@ def _make_para_style(font_name: str, script: str) -> ParagraphStyle:
         fontSize=12,
         leading=18,
         textColor=C_BODY,
-        spaceAfter=4,
+        spaceAfter=8,
         alignment=TA_RIGHT if script == "arabic" else TA_LEFT,
     )
 
 
+_HEADING_SIZES = {1: 21, 2: 18, 3: 16, 4: 14, 5: 12.5, 6: 12}
+
+
+def _heading_style(level: int, font_name: str, script: str) -> ParagraphStyle:
+    size = _HEADING_SIZES.get(level, 12)
+    return ParagraphStyle(
+        f"h{level}",
+        fontName=font_name,
+        fontSize=size,
+        leading=size * 1.25,
+        textColor=C_BODY,
+        spaceBefore=14 if level <= 2 else 8,
+        spaceAfter=6,
+        alignment=TA_RIGHT if script == "arabic" else TA_LEFT,
+    )
+
+
+def _quote_block(text_xml: str, font_name: str, accent_color) -> Table:
+    style = ParagraphStyle("quote", fontName=font_name, fontSize=11.5, leading=16, textColor=C_QUOTE)
+    para = Paragraph(text_xml, style)
+    width = PAGE_W - 2 * MG
+    tbl = Table([["", para]], colWidths=[5, width - 5])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, 0), accent_color),
+        ("LEFTPADDING", (1, 0), (1, 0), 10),
+        ("LEFTPADDING", (0, 0), (0, 0), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    return tbl
+
+
+def _code_block_flowable(code_text: str) -> Table:
+    style = ParagraphStyle("code", fontName="Courier", fontSize=9.5, leading=13, textColor=C_BODY)
+    pre = Preformatted(code_text, style)
+    width = PAGE_W - 2 * MG
+    tbl = Table([[pre]], colWidths=[width])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), C_CODE_BG),
+        ("BOX", (0, 0), (-1, -1), 0.5, C_CODE_BOX),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    return tbl
+
+
+def _build_list(items_xml: list[str], font_name: str, ordered: bool) -> ListFlowable:
+    style = ParagraphStyle("li", fontName=font_name, fontSize=12, leading=17, spaceAfter=3)
+    items = [ListItem(Paragraph(t, style), leftIndent=4) for t in items_xml]
+    return ListFlowable(
+        items,
+        bulletType="1" if ordered else "bullet",
+        start=1 if ordered else None,
+        leftIndent=20,
+        bulletFontName="Helvetica",
+        bulletFontSize=11,
+        bulletColor=C_BODY,
+        spaceBefore=2,
+        spaceAfter=10,
+    )
+
+
+def _markdown_to_story(text: str, latin_font: str, accent_color) -> list:
+    """Render markdown (the same kind Claude outputs: headings, **bold**,
+    *italic*, `code`, fenced code blocks, lists, quotes, links, hr) into a
+    Platypus story, auto-selecting Unicode fonts per block as before."""
+    blocks = _parse_markdown_blocks(text)
+    story: list = []
+    pending_items: list[str] = []
+    pending_ordered: bool | None = None
+
+    def _flush_list():
+        nonlocal pending_items, pending_ordered
+        if pending_items:
+            script = _detect_script(" ".join(pending_items))
+            font_name = _pick_font(script, latin_font)
+            story.append(_build_list(pending_items, font_name, bool(pending_ordered)))
+        pending_items = []
+        pending_ordered = None
+
+    for btype, content in blocks:
+        if btype in ("ul", "ol"):
+            ordered = (btype == "ol")
+            if pending_items and pending_ordered != ordered:
+                _flush_list()
+            pending_ordered = ordered
+            pending_items.append(_inline_to_xml(content))
+            continue
+
+        _flush_list()
+
+        if btype == "hr":
+            story.append(Spacer(1, 4))
+            story.append(HRFlowable(width="100%", thickness=0.6, color=accent_color, spaceAfter=10))
+            continue
+
+        if btype == "code":
+            story.append(Spacer(1, 2))
+            story.append(_code_block_flowable(content))
+            story.append(Spacer(1, 8))
+            continue
+
+        if btype == "quote":
+            script = _detect_script(content)
+            font_name = _pick_font(script, latin_font)
+            story.append(_quote_block(_inline_to_xml(content), font_name, accent_color))
+            story.append(Spacer(1, 4))
+            continue
+
+        if btype.startswith("h") and btype[1:].isdigit():
+            level = int(btype[1:])
+            script = _detect_script(content)
+            font_name = _pick_font(script, latin_font)
+            xml = f"<b>{_inline_to_xml(content)}</b>"
+            story.append(Paragraph(xml, _heading_style(level, font_name, script)))
+            continue
+
+        # plain paragraph
+        script = _detect_script(content)
+        font_name = _pick_font(script, latin_font)
+        display = _prepare_line(content, script) if script == "arabic" else content
+        xml = _inline_to_xml(display)
+        story.append(Paragraph(xml, _make_para_style(font_name, script)))
+
+    _flush_list()
+    return story
+
+
 def _text_to_story(text: str, latin_font: str) -> list:
-    """Convert plain text to a Platypus story, auto-selecting Unicode fonts."""
+    """Plain-text fallback (no markdown parsing) — kept so a malformed
+    markdown edge case can never crash PDF generation outright."""
     story = []
     for line in text.split("\n"):
         if not line.strip():
             story.append(Spacer(1, 6))
             continue
-        script     = _detect_script(line)
-        font_name  = _pick_font(script, latin_font)
-        display    = _prepare_line(line, script)
-        safe       = html.escape(display)
+        script = _detect_script(line)
+        font_name = _pick_font(script, latin_font)
+        display = _prepare_line(line, script)
+        safe = html.escape(display)
         story.append(Paragraph(safe, _make_para_style(font_name, script)))
     return story
 
@@ -301,7 +592,14 @@ def _build_pdf(story: list, theme_key: str) -> bytes:
 def make_pdf(text: str, theme_key: str = DEFAULT_THEME,
              font_key: str = DEFAULT_FONT) -> bytes:
     latin_font = FONTS.get(font_key, FONTS[DEFAULT_FONT])[0]
-    story = _text_to_story(text, latin_font)
+    accent_color = THEMES.get(theme_key, THEMES[DEFAULT_THEME])[0]
+    try:
+        story = _markdown_to_story(text, latin_font, accent_color)
+        if not story:
+            story = [Spacer(1, 1)]
+    except Exception as e:
+        logging.warning(f"Markdown rendering failed, falling back to plain text: {e}")
+        story = _text_to_story(text, latin_font)
     return _build_pdf(story, theme_key)
 
 
@@ -309,10 +607,15 @@ def make_pdf_with_image(img_bytes: bytes, caption: str,
                         theme_key: str = DEFAULT_THEME,
                         font_key: str = DEFAULT_FONT) -> bytes:
     latin_font = FONTS.get(font_key, FONTS[DEFAULT_FONT])[0]
+    accent_color = THEMES.get(theme_key, THEMES[DEFAULT_THEME])[0]
     story = _image_story(img_bytes)
     if caption.strip():
         story.append(Spacer(1, 0.4 * cm))
-        story.extend(_text_to_story(caption, latin_font))
+        try:
+            story.extend(_markdown_to_story(caption, latin_font, accent_color))
+        except Exception as e:
+            logging.warning(f"Markdown caption rendering failed, falling back: {e}")
+            story.extend(_text_to_story(caption, latin_font))
     return _build_pdf(story, theme_key)
 
 
@@ -349,7 +652,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "there"
     await update.message.reply_text(
         f"👋 Hey {name}! Welcome to *PDF Bot*.\n\n"
-        "Send me any text — in *any language* — and I'll turn it into a beautiful PDF.\n"
+        "Send me any text — in *any language*, with Markdown formatting — "
+        "and I'll turn it into a beautiful PDF that keeps your formatting.\n"
         "Send a *photo with a caption* and I'll include both.\n\n"
         "/font  — choose a typeface\n"
         "/style — choose an accent tint\n"
@@ -362,9 +666,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📄 *PDF Bot — Help*\n\n"
         "*Supported input:*\n"
-        "• Plain text (any language)\n"
+        "• Plain or Markdown-formatted text (any language)\n"
         "• Photo → PDF with embedded image\n"
         "• Photo + caption → image and text together\n\n"
+        "*Markdown formatting kept in the PDF:*\n"
+        "`# Headings`, `**bold**`, `*italic*`, `~~strike~~`,\n"
+        "`` `inline code` ``, fenced \\`\\`\\` code blocks \\`\\`\\`,\n"
+        "`- bullet` / `1. numbered` lists, `> quotes`,\n"
+        "`[links](url)` and `---` dividers\n\n"
         "*Languages supported:*\n"
         "Amharic 🇪🇹, Arabic 🇸🇦, Hindi 🇮🇳, Thai 🇹🇭,\n"
         "Latin/Greek/Cyrillic and more\n\n"
@@ -443,7 +752,7 @@ async def _send_pdf(update: Update, pdf_bytes: bytes) -> None:
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         raw = update.message.text
-        if not raw:
+        if not raw or not raw.strip():
             await update.message.reply_text("Please send a text message.")
             return
         try:
@@ -490,29 +799,35 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ── Wire up & run ─────────────────────────────────────────────────────────────
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", cmd_start))
-app.add_handler(CommandHandler("help",  cmd_help))
-app.add_handler(CommandHandler("font",  cmd_font))
-app.add_handler(CommandHandler("style", cmd_style))
-app.add_handler(CallbackQueryHandler(cb_font,  pattern=r"^font:"))
-app.add_handler(CallbackQueryHandler(cb_theme, pattern=r"^theme:"))
-app.add_handler(MessageHandler(filters.PHOTO,                         handle_photo))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,       handle_text))
-app.add_error_handler(error_handler)
-print("Bot running...")
+def main() -> None:
+    if not RAILWAY_DOMAIN:
+        Thread(target=lambda: app_web.run(host='0.0.0.0', port=PORT), daemon=True).start()
 
-if RAILWAY_DOMAIN:
-    # Production (Railway): webhook mode — Telegram pushes updates, no polling conflicts
-    logging.info(f"Webhook mode → https://{RAILWAY_DOMAIN}/{BOT_TOKEN}")
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=BOT_TOKEN,
-        webhook_url=f"https://{RAILWAY_DOMAIN}/{BOT_TOKEN}",
-        drop_pending_updates=True,
-    )
-else:
-    # Local / Replit: polling mode
-    logging.info("Polling mode (local)")
-    app.run_polling(drop_pending_updates=True)
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help",  cmd_help))
+    app.add_handler(CommandHandler("font",  cmd_font))
+    app.add_handler(CommandHandler("style", cmd_style))
+    app.add_handler(CallbackQueryHandler(cb_font,  pattern=r"^font:"))
+    app.add_handler(CallbackQueryHandler(cb_theme, pattern=r"^theme:"))
+    app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(error_handler)
+    print("Bot running...")
+
+    if RAILWAY_DOMAIN:
+        logging.info(f"Webhook mode → https://{RAILWAY_DOMAIN}/{BOT_TOKEN}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=BOT_TOKEN,
+            webhook_url=f"https://{RAILWAY_DOMAIN}/{BOT_TOKEN}",
+            drop_pending_updates=True,
+        )
+    else:
+        logging.info("Polling mode (local)")
+        app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
